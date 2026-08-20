@@ -1,7 +1,7 @@
 # movie-recs — quickstart
 
 Skill: `~/.claude/skills/movie-recs/` · script: `movie_recs.py` (stdlib only, ~90 KB)
-Full reference: [`SKILL.md`](./SKILL.md). Read this first, then ask the agent.
+Full reference: [`SKILL.md`](../SKILL.md). Read this first, then ask the agent.
 
 ## 1. Get the three keys
 
