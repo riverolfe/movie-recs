@@ -130,11 +130,12 @@ Read the request, pick one flag. That's the whole job.
 | "best Liam Neeson films" | `python3 $SCRIPT --actor "Liam Neeson"` |
 | "that film where a boy hides an alien" | `python3 $SCRIPT --plot-query "a young boy hides an alien"` |
 | two-angled plot: "courtroom thriller AND innocent man proves himself" | `python3 $SCRIPT --plot-queries "courtroom thriller" "innocent man proves himself"` |
+| "best Hungarian movies" / "Hungarian classics" / "Norwegian cinema" | `python3 $SCRIPT --plot-query "best Hungarian cinema loved by Hungarians" --nationality HU` (ISO 3166-1 alpha-2: HU, NO, JP, FR, …) |
 | bypass the Gemini default and use the legacy TMDB-keyword-pool + Claude rerank pipeline | add `--no-google` |
 | any of the above, but nice to look at | add `--html` → writes `watch_{slug}.html` (slug from query), print path as clickable terminal link |
 | write HTML to a specific path | add `--out /path/to/file.html` to override the auto-slug |
 
-Other flags: `--reviews N` (default 3, HTML only), `--no-omdb` (skip OMDb even if the key is set).
+Other flags: `--reviews N` (default 3, HTML only), `--no-omdb` (skip OMDb even if the key is set), `--nationality CC` (ISO 3166-1 alpha-2 — keeps only films with that country in `origin_country` or matching `original_language`; works with any mode).
 
 Output is plain text (`Title (Year) — Rating/10` + overview) unless `--html`.
 

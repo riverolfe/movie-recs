@@ -33,6 +33,7 @@ python3 movie_recs.py --similar-to "Inception"     # recommendation by seed titl
 python3 movie_recs.py --actor "Liam Neeson"        # filmography
 python3 movie_recs.py --plot-query "a boy hides an alien"   # Gemini ranks ~25 candidates
 python3 movie_recs.py --plot-queries "satire" "idiots in power"   # union, dedupe by id
+python3 movie_recs.py --plot-query "best Hungarian cinema" --nationality HU   # single-country filter (ISO 3166-1 alpha-2)
 ```
 
 Add `--html` to any of the above for a self-contained `watch_{slug}.html` (posters, provider filter, reviews, IMDb/RT links).

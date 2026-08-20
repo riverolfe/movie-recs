@@ -8,6 +8,7 @@ Set TMDB_API_KEY in your shell, then:
   python movie_recs.py --similar-to "The Spy" --year 2019 --no-animated → TV series recommendations
   python movie_recs.py --actor "Liam Neeson"                            → actor filmography
   python movie_recs.py --plot-query "a young boy fights aliens"         → rank popular pool by plot text
+  python movie_recs.py --plot-query "best Hungarian cinema" --nationality HU   → filter to a single country's films
 
 Optional: set OMDB_API_KEY for a longer plot paragraph (OMDb `plot=full`) per movie.
 Keywords: spy (default), espionage, assassin, time-travel.
@@ -1641,6 +1642,11 @@ if __name__ == "__main__":
                         help="(default) Use Gemini to recommend titles; with --plot-queries runs one call per phrasing")
     parser.add_argument("--no-google", dest="google", action="store_false",
                         help="Use the TMDB keyword pool + per-film LLM scoring instead of Gemini")
+    # ponytail: --nationality filters every result mode (keyword/similar/actor/plot) to films whose
+    # origin_country list contains this ISO 3166-1 alpha-2 code. Trivial filter on TMDB's existing
+    # origin_country field — no extra API calls. Pair with --plot-query for "best films from X".
+    parser.add_argument("--nationality", metavar="CC",
+                        help="ISO 3166-1 alpha-2 country code (e.g. HU, NO, JP, FR); keeps only films from that country")
     args = parser.parse_args()
 
     key = os.environ["TMDB_API_KEY"]
@@ -1701,6 +1707,20 @@ if __name__ == "__main__":
     # ponytail: plot_query_search / plot_queries_search already rank by LLM relevance and apply the
     # blockbuster quota — re-running shortlist() would re-sort by vote_average and discard both.
     # Other modes are unranked.
+    if args.nationality:
+        cc = args.nationality.upper()
+        lang = cc.lower()
+        # ponytail: TMDB /search/movie (used by Gemini resolver) doesn't carry origin_country — only
+        # original_language. Check both: a film made in Hungary is also released in Hungarian. For
+        # English-language films the user can drop --nationality; it's a coarse signal either way.
+        def _native(m: dict) -> bool:
+            if cc in (m.get("origin_country") or []): return True
+            return m.get("original_language", "").lower() == lang
+        before = len(raw)
+        raw = [m for m in raw if _native(m)]
+        print(f"[nationality] {cc}: {before} → {len(raw)} films")
+        if not raw:
+            sys.exit(f"no films matched --nationality {cc!r}")
     ranked_modes = args.plot_query or args.plot_queries
     movies = raw[:10] if ranked_modes else shortlist(raw)
 
