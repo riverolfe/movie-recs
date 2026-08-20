@@ -37,4 +37,4 @@ notebooks.json  UUIDs of the two NotebookLM notebooks (recs + plots)
 
 ## License
 
-Not specified yet. Add one if you intend to distribute.
+[MIT](./LICENSE) — Copyright (c) 2026 riverolfe.
