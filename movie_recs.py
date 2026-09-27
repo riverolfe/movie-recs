@@ -14,17 +14,25 @@ Optional: set OMDB_API_KEY for a longer plot paragraph (OMDb `plot=full`) per mo
 Keywords: spy (default), espionage, assassin, time-travel.
 """
 import argparse
+import datetime
+import gzip
 import html as html_lib
+import io
+import itertools
 import json
 import os
+import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 API = "https://api.themoviedb.org/3"
+IMDB_URL = "https://www.imdb.com/title/{}/"
 
 KEYWORDS = {"spy": 470, "espionage": 158431, "assassin": 1701, "time-travel": 4379}
 
@@ -172,7 +180,7 @@ def get(path: str, params: dict, *, key: str) -> Any:
 
 def shortlist(movies: list, n: int = 10) -> list:
     """Top-N movies by vote_average. Rating-only sort; popularity-weight when recall > precision."""
-    return sorted(movies, key=lambda m: m.get("vote_average", 0), reverse=True)[:n]
+    return sorted(movies, key=lambda m: m.get("vote_average") or 0, reverse=True)[:n]
 
 
 def discover(keyword: str, key: str, min_votes: int = 200, since: Optional[int] = None) -> list:
@@ -230,8 +238,7 @@ def print_movies(movies: list, key: str = None) -> None:
     for m in movies:
         movie = Movie.from_api(m)
         title_text = f"{movie.display_title} ({movie.display_year}) — {movie.vote_average:.1f}/10"
-        # Reuse an IMDb URL already cached on the dict; otherwise look it up.
-        imdb_url = m.get("_imdb_url") or (get_imdb_url("movie" if not movie.is_tv else "tv", movie.id, key) if key else None)
+        imdb_url = get_imdb_url("movie" if not movie.is_tv else "tv", movie.id, key) if key else None
         if imdb_url:
             title_text = f"\033]8;;{imdb_url}\033\\{title_text}\033]8;;\033\\"
         print(title_text)
@@ -246,8 +253,7 @@ def slug_for_query(query: str, max_len: int = 60) -> str:
     Two safeguards: drop empty parts (lots of "the a of" gets dropped) and cap overall length so
     flag-heavy calls ("--plot-queries 'a' 'b' 'c'") don't generate 200-char filenames.
     """
-    import re as _re
-    parts = [w for w in _re.split(r"[^a-z0-9]+", query.lower()) if w]
+    parts = [w for w in re.split(r"[^a-z0-9]+", query.lower()) if w]
     slug = "-".join(parts)
     if len(slug) > max_len:
         slug = slug[:max_len].rsplit("-", 1)[0]  # chunk at last word boundary
@@ -295,16 +301,6 @@ def get_config(key: str) -> dict:
     return get("/configuration", {}, key=key)
 
 
-def get_imdb_url(media_type: str, item_id: int, key: str) -> Optional[str]:
-    """Resolve a TMDB title to its IMDB URL, or None if the title has no imdb_id."""
-    try:
-        ids = get(f"/{media_type}/{item_id}/external_ids", {}, key=key)
-    except SystemExit:
-        return None
-    imdb_id = ids.get("imdb_id")
-    return f"https://www.imdb.com/title/{imdb_id}/" if imdb_id else None
-
-
 def get_imdb_id(media_type: str, item_id: int, key: str) -> Optional[str]:
     """Resolve a TMDB title to its bare IMDb ID (`tt1234567`), or None."""
     try:
@@ -314,38 +310,35 @@ def get_imdb_id(media_type: str, item_id: int, key: str) -> Optional[str]:
     return ids.get("imdb_id")
 
 
-def _imdb_id_from_url(url: Optional[str]) -> Optional[str]:
-    """Extract `tt1234567` from an IMDB title URL, or None."""
-    if not url:
-        return None
-    parts = url.rstrip("/").split("/")
-    return parts[-1] if parts[-1].startswith("tt") else None
+def get_imdb_url(media_type: str, item_id: int, key: str) -> Optional[str]:
+    """Resolve a TMDB title to its IMDB URL, or None if the title has no imdb_id."""
+    imdb_id = get_imdb_id(media_type, item_id, key)
+    return IMDB_URL.format(imdb_id) if imdb_id else None
 
 
-def omdb_long_plot(imdb_id: str, omdb_key: str) -> Optional[str]:
-    """Fetch OMDb's full plot for a movie by IMDb ID. None on failure or OMDb error."""
+def omdb_fetch(imdb_id: str, omdb_key: str) -> Optional[dict]:
+    """Fetch one OMDb record for an IMDb ID, or None on any failure / OMDb error.
+
+    One call covers everything we want from OMDb: `plot=full` swaps only the Plot field,
+    so the Ratings array (and the RT score inside it) still comes back on the same request.
+    """
     qs = urllib.parse.urlencode({"i": imdb_id, "plot": "full", "apikey": omdb_key})
     try:
         with urllib.request.urlopen(f"http://www.omdbapi.com/?{qs}", timeout=10) as r:
             data = json.load(r)
     except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
         return None
-    if data.get("Response") == "False":
-        return None
-    return data.get("Plot")
+    return None if data.get("Response") == "False" else data
 
 
-def omdb_rt_score(imdb_id: str, omdb_key: str) -> Optional[str]:
-    """Fetch the Rotten Tomatoes score from OMDb's Ratings array (e.g. '85%'). None on miss."""
-    qs = urllib.parse.urlencode({"i": imdb_id, "apikey": omdb_key})
-    try:
-        with urllib.request.urlopen(f"http://www.omdbapi.com/?{qs}", timeout=10) as r:
-            data = json.load(r)
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
-        return None
-    if data.get("Response") == "False":
-        return None
-    for rating in data.get("Ratings", []):
+def omdb_long_plot(imdb_id: str, omdb_key: str) -> Optional[str]:
+    """OMDb's full plot paragraph for a movie by IMDb ID. None on failure or OMDb error."""
+    return (omdb_fetch(imdb_id, omdb_key) or {}).get("Plot")
+
+
+def omdb_rt_score(record: Optional[dict]) -> Optional[str]:
+    """Rotten Tomatoes score (e.g. '85%') from an omdb_fetch record, or None if absent."""
+    for rating in (record or {}).get("Ratings", []):
         if rating.get("Source") == "Rotten Tomatoes":
             return rating.get("Value")
     return None
@@ -379,7 +372,6 @@ def keyword_catalog(force: bool = False) -> dict:
         if cached:
             return cached
 
-    import datetime, gzip, io
     catalog: dict = {}
     today = datetime.date.today()
     for back in range(1, 5):  # Day-1 is the newest reliably-published export.
@@ -423,8 +415,6 @@ def keywords_in_query(query: str, catalog: dict, limit: int = 4) -> List[int]:
     """
     if not catalog:
         return []
-    import itertools
-    import re
 
     def variants(word: str) -> List[str]:
         """Word plus plausible base forms, longest-shot last. Order matters — verbatim wins."""
@@ -468,8 +458,6 @@ def keywords_in_query(query: str, catalog: dict, limit: int = 4) -> List[int]:
 @_plot_cache
 def wikipedia_plot(title: str) -> Optional[str]:
     """Fetch the full Plot section from Wikipedia for a movie title. None on miss."""
-    import re
-    import time
     headers = {"User-Agent": "movie-recs/1.0 (personal project)"}
     try:
         search_qs = urllib.parse.urlencode({"action": "query", "list": "search",
@@ -527,7 +515,6 @@ _STOPWORDS = {"a", "an", "the", "to", "has", "have", "had", "is", "are", "was", 
 
 def _get_json_with_retry(url: str, headers: dict, max_retries: int = 1, deadline_s: float = 5.0) -> Optional[Any]:
     """GET a URL as JSON, retrying once on 429 with Retry-After backoff. Bails if total time exceeds deadline_s."""
-    import time
     start = time.monotonic()
     for attempt in range(max_retries + 1):
         try:
@@ -563,7 +550,6 @@ def wikipedia_plot_from_imdb(imdb_id: str) -> Optional[str]:
     """
     if not imdb_id:
         return None
-    import re, time
     headers = {"User-Agent": "movie-recs/1.0 (personal project)"}
 
     # Step 1: Wikidata search by IMDb ID (P345 = film/TV IMDb ID property)
@@ -638,9 +624,11 @@ def _score_plot(plot: str, query: str) -> int:
     # Stemmer is "drop trailing 's'" — handles alien/aliens, boy/boys; full Porter is overkill here.
     stem = lambda w: w[:-1] if w.endswith("s") and len(w) > 3 else w
     score = 10 if query_lower in plot_lower else 0
-    # Drop stopwords — "a", "to", "the" would otherwise match every plot.
-    query_content = {stem(w) for w in query_lower.split() if w not in _STOPWORDS}
-    plot_stems = {stem(w) for w in plot_lower.split()}
+    # Tokenize to [a-z0-9]+ so punctuation can't glue a query word into a shape no plot uses:
+    # "alien," must still match "alien", or a comma silently costs the film a match (and the
+    # stopword check misses "the," the same way).
+    query_content = {stem(w) for w in re.findall(r"[a-z0-9]+", query_lower) if w not in _STOPWORDS}
+    plot_stems = {stem(w) for w in re.findall(r"[a-z0-9]+", plot_lower)}
     score += len(query_content & plot_stems) * 2
     return score
 
@@ -666,7 +654,9 @@ def _llm_score_plot(plot: str, query: str) -> int:
         client = anthropic.Anthropic()
         response = client.messages.create(
             model="claude-opus-5",
-            max_tokens=500,  # Generous cap so thinking + integer reply never truncates mid-thought.
+            # Thinking is on by default on Opus 5, so the cap has to cover the reasoning too —
+            # 500 truncated mid-thought and took the integer with it.
+            max_tokens=2000,
             messages=[{
                 "role": "user",
                 "content": (
@@ -684,15 +674,19 @@ def _llm_score_plot(plot: str, query: str) -> int:
         _LLM_USAGE["input"] += response.usage.input_tokens
         _LLM_USAGE["output"] += response.usage.output_tokens
         # Parse defensively — the model occasionally adds a word before or after the number.
-        import re
-        text = response.content[0].text.strip()
+        # Read the text block by type, not by index: with thinking on, content[0] is a
+        # ThinkingBlock (which has .thinking, not .text) and indexing would AttributeError.
+        # stop_reason is the other half: max_tokens means the budget ate the answer, refusal
+        # means there is no score at all. Both fall back to token-overlap.
+        if response.stop_reason != "end_turn":
+            return -1
+        text = next((b.text for b in response.content if b.type == "text"), "").strip()
         match = re.search(r"\d+", text)
         if not match:
             return -1
         return max(0, min(10, int(match.group())))
     except anthropic.RateLimitError as e:
         # Warn explicitly when rate-limited so a silent fallback doesn't degrade scores unnoticed.
-        import warnings
         warnings.warn(f"LLM scoring rate-limited, falling back to token-overlap: {e}", stacklevel=2)
         return -1
     except Exception:
@@ -769,8 +763,10 @@ def plot_queries_search(queries: List[str], key: str, *, quick: bool = False) ->
         if best > floor:
             scored.append({**m, "_score": best})
     # Thin-list rescue: if the floor left a near-empty shortlist, expand via CF neighbors of the top
-    # seeds and re-score against the original queries.
-    return thin_rescue(scored, queries, key, quick=quick)
+    # seeds and re-score against the original queries. The quota is applied here, once, so it covers
+    # both the normal path and the rescue path — applying it inside thin_rescue alone left it dead
+    # whenever the shortlist was already long enough to skip rescue.
+    return apply_blockbuster_quota(thin_rescue(scored, queries, key, quick=quick, seeds=prefilter))
 
 
 def _full_text(m: dict, key: str) -> str:
@@ -791,7 +787,10 @@ def _quick_text(m: dict, key: str) -> str:
     """
     media_type = "movie"
     imdb_id = get_imdb_id(media_type, m["id"], key)
-    long_plot = omdb_long_plot(imdb_id, os.environ.get("OMDB_API_KEY")) if imdb_id else None
+    omdb_key = os.environ.get("OMDB_API_KEY")
+    # Guard on the key, not just the id — an unset key still builds a request (apikey=None)
+    # that can only come back empty, costing a round-trip per film.
+    long_plot = omdb_long_plot(imdb_id, omdb_key) if (omdb_key and imdb_id) else None
     return long_plot or m.get("overview", "") or ""
 
 
@@ -807,21 +806,31 @@ STRICT_FLOOR = 4
 QUICK_FLOOR = -1
 
 
-def thin_rescue(scored: list, queries: List[str], key: str, *, quick: bool = False) -> list:
+def thin_rescue(scored: list, queries: List[str], key: str, *, quick: bool = False,
+                seeds: Optional[list] = None) -> list:
     """If `scored` has fewer than THIN_RESCUE_MIN_RESULTS cards, pull recommendations for the top
     THIN_RESCUE_SEEDS, score the new films against the queries, and return a merged list.
 
     Re-scoring is intentional: a seed's CF neighbors aren't assumed to match the query. We just use
-    CF as a hint to widen the pool; the same floor applies. Re-running the quota on the final list
-    keeps the blockbuster cap in play even after rescue.
+    CF as a hint to widen the pool; the same floor applies. The caller applies the blockbuster quota
+    to whatever comes back, so this function only has to hand over a ranked list.
+
+    `seeds` is the caller's broader prefilter, used only when `scored` is empty: with no survivors
+    there is nothing to expand from, and the rescue would do nothing on exactly the queries that
+    needed it most.
     """
     if len(scored) >= THIN_RESCUE_MIN_RESULTS:
         return scored
+    # Seed from the survivors, falling back to the wider prefilter when the floor culled
+    # everything, so rescue is reachable in the zero-survivor case.
+    pool = scored[:THIN_RESCUE_SEEDS] or list(seeds or [])[:THIN_RESCUE_SEEDS]
     # Print a one-line marker so users can see in CLI runs whether rescue fired.
-    print(f"[thin_rescue] entering with {len(scored)} cards, {len(scored[:THIN_RESCUE_SEEDS])} seeds", flush=True)
+    # stderr, so this diagnostic never lands in piped stdout.
+    print(f"[thin_rescue] entering with {len(scored)} cards, {len(pool)} seeds",
+          file=sys.stderr, flush=True)
     seen_ids = {m["id"] for m in scored}
     new_candidates: List[dict] = []
-    for seed in scored[:THIN_RESCUE_SEEDS]:
+    for seed in pool:
         for r in recommendations_for(seed.get("title", ""), key):
             if r["id"] in seen_ids:
                 continue
@@ -848,10 +857,9 @@ def thin_rescue(scored: list, queries: List[str], key: str, *, quick: bool = Fal
         if score > floor:
             rescued.append({**m, "_score": score})
 
-    # Union + re-sort. Quota is reapplied at the end so rescue can't flood the top with
+    # Union + re-sort. Quota is applied by the caller so rescue can't flood the top with
     # blockbusters the way the original shortlist would have.
-    merged = scored + rescued
-    return apply_blockbuster_quota(sorted(merged, key=lambda m: m["_score"], reverse=True))
+    return sorted(scored + rescued, key=lambda m: m["_score"], reverse=True)
 
 
 def _build_plot_pool(queries: List[str], key: str) -> tuple:
@@ -967,7 +975,6 @@ def gemini_recommendations(query: str, key: str, n: int = 25) -> List[dict]:
     text = response["candidates"][0]["content"]["parts"][0]["text"].strip()
 
     # Parse "1. Title", "1) Title", or "- Title (Year)" lines. Strip numbering and parenthetical year.
-    import re
     titles: List[str] = []
     for line in text.splitlines():
         line = line.strip()
@@ -1027,11 +1034,13 @@ def apply_blockbuster_quota(ranked: list, votes: int = BLOCKBUSTER_VOTES,
     # leftover blockbusters backfill the head — a cap on competition for slots, not a hard reservation.
     head = big[:quota] + small[: max(0, n - quota)]
     if len(head) < n:
-        backfill = [m for m in big[quota:] if m not in head]
-        head += backfill[: n - len(head)]
+        # Membership is tested on object identity, not dict equality: two films with
+        # identical fields compare equal, and the second would silently drop out.
+        picked = {id(m) for m in head}
+        head += [m for m in big[quota:] if id(m) not in picked][: n - len(head)]
     head.sort(key=lambda m: m.get("_score", 0), reverse=True)
-    tail = [m for m in ranked if m not in head]
-    return head + tail
+    picked = {id(m) for m in head}
+    return head + [m for m in ranked if id(m) not in picked]
 
 
 def poster_img(movie: Movie, base_url: str) -> str:
@@ -1122,7 +1131,7 @@ def _movie_card(row: Row) -> str:
         f'<p class="overview">{html_lib.escape(m.overview[:300])}</p>'
         f'{_keywords_block(row.keywords)}'
         f'{_long_plot_block(row.long_plot)}'
-        f'<div class="reviews"><h3>Top 3 reviews</h3>{_review_block(row.reviews)}</div>'
+        f'<div class="reviews"><h3>Reviews</h3>{_review_block(row.reviews)}</div>'
         f'<div class="providers"><strong>Streaming:</strong> {_provider_badges(row.providers)}</div>'
         f"</div></article>"
     )
@@ -1271,11 +1280,10 @@ def render_html(movies: list, key: str, out_path: str = "watch_recommendations.h
         movie = Movie.from_api(m)
         # `title` → movie, `name` → TV; routes the per-title calls to the right endpoint family.
         media_type = "tv" if movie.is_tv else "movie"
-        imdb_url = get_imdb_url(media_type, movie.id, key)
-        imdb_id = _imdb_id_from_url(imdb_url) if imdb_url else None
-        long_plot: Optional[str] = None
-        if omdb_key and imdb_id:
-            long_plot = omdb_long_plot(imdb_id, omdb_key)
+        imdb_id = get_imdb_id(media_type, movie.id, key)
+        imdb_url = IMDB_URL.format(imdb_id) if imdb_id else None
+        # One OMDb request per movie serves both the long plot and the RT score.
+        omdb = omdb_fetch(imdb_id, omdb_key) if (omdb_key and imdb_id) else None
         rows.append(Row(
             movie=movie,
             media_type=media_type,
@@ -1284,8 +1292,8 @@ def render_html(movies: list, key: str, out_path: str = "watch_recommendations.h
             providers=get_providers(media_type, movie.id, key, region),
             reviews=get_reviews(media_type, movie.id, key, n=reviews_n),
             keywords=get_keywords(media_type, movie.id, key),
-            long_plot=long_plot,
-            rt_score=omdb_rt_score(imdb_id, omdb_key) if (omdb_key and imdb_id) else None,
+            long_plot=(omdb or {}).get("Plot"),
+            rt_score=omdb_rt_score(omdb),
             # Empty string when no omdb_key — the template skips the RT link in that case.
             rt_url=(f"https://www.rottentomatoes.com/search?search={urllib.parse.quote(movie.display_title)}"
                     if omdb_key else ""),
@@ -1295,7 +1303,7 @@ def render_html(movies: list, key: str, out_path: str = "watch_recommendations.h
         ))
     body = "\n".join(_movie_card(r) for r in rows)
     sidebar = _sidebar_html()
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(_html_template(body, sidebar))
     return out_path
 
@@ -1315,274 +1323,8 @@ def _sidebar_html() -> str:
     )
 
 
-if __name__ == "__main__":
-    # Smoke check: plot cache must actually memoize (second call hits, no re-fetch).
-    # Uses a local decorated function so the check costs no network I/O.
-    _calls = []
-
-    @_plot_cache
-    def _cache_probe(x: str) -> str:
-        _calls.append(x)
-        return x.upper()
-
-    _cache_probe("_smoke_")
-    _cache_probe("_smoke_")
-    if "diskcache" in sys.modules:
-        assert len(_calls) == 1, f"plot cache not memoizing (called {len(_calls)}x)"
-        _cache_probe.__cache_key__ and _CACHE.delete(_cache_probe.__cache_key__("_smoke_"))
-
-    # Smoke check: blockbuster quota caps big-vote films in the top 10 without dropping them.
-    _bb = [{"title": f"big{i}", "vote_count": 20000, "_score": 10 - i} for i in range(6)]
-    _sm = [{"title": f"sml{i}", "vote_count": 500, "_score": 5 - i} for i in range(8)]
-    _q = apply_blockbuster_quota(_bb + _sm)
-    assert sum(1 for m in _q[:10] if m["vote_count"] >= 8000) == 3, "at most 3 blockbusters in top 10"
-    assert len(_q) == 14, "quota reorders, never drops"
-    assert [m["title"] for m in _q[:3]] == ["big0", "big1", "big2"], "score order kept within head"
-    # When small films run short, the head backfills with blockbusters rather than under-filling.
-    _short = apply_blockbuster_quota(_bb + _sm[:2])
-    assert len(_short) == 8 and _short[:1][0]["title"] == "big0", "backfill when small pool is thin"
-    # An all-blockbuster pool must still return them — quota is a cap, not a requirement.
-    assert len(apply_blockbuster_quota(_bb)) == 6, "all-blockbuster pool survives"
-    assert apply_blockbuster_quota([]) == [], "empty pool is not fatal"
-
-    # Smoke check: plot_queries_search in offline mode takes max-of-queries per film.
-    # Forces the no-LLM path with monkeypatching so the check costs no network or Anthropic tokens.
-    import contextlib, io as _io
-    _pool = [
-        {"id": 1, "title": "Movie A", "overview": "lawyer courtroom thriller innocent", "vote_count": 100},
-        {"id": 2, "title": "Movie B", "overview": "spy assassin thriller", "vote_count": 100},
-    ]
-    def _patched_get(path, params, *, key):
-        return {"results": [
-            {"id": 1, "title": "Movie A", "overview": "lawyer courtroom thriller innocent",
-             "vote_count": 100},
-            {"id": 2, "title": "Movie B", "overview": "spy assassin thriller", "vote_count": 100},
-        ]}
-    def _patched_wp(_): return None
-    # A's plot matches both query phrasings; B's matches neither; the union prefilter keeps A.
-    # Patched get_imdb_id returns a valid IMDb id so _full_text reaches wikipedia_plot_from_imdb;
-    # without it the external_ids lookup misses and _full_text falls back to the TMDB overview,
-    # which only overlaps each phrasing on 1-2 tokens — max score 4 vs STRICT_FLOOR=4 → A dropped.
-    # IMDb ids are per TMDB id so thin_rescue doesn't smuggle A's plot into B's text.
-    _A_PLOT = "the protagonist is an innocent man wrongfully convicted by a clever lawyer in court"
-    _imdb_for_id = {1: "tt0000001", 2: "tt0000002"}
-    _plot_for_imdb = {"tt0000001": _A_PLOT}
-    def _patched_get_imdb(media_type, item_id, key):
-        return _imdb_for_id.get(item_id)
-    def _patched_wpimdb(imdb_id):
-        return _plot_for_imdb.get(imdb_id)
-    import sys as _sys
-    _mod = _sys.modules[__name__]
-    _orig_get, _orig_get_imdb, _orig_wp, _orig_wpimdb = _mod.get, _mod.get_imdb_id, _mod.wikipedia_plot, _mod.wikipedia_plot_from_imdb
-    _mod.get, _mod.get_imdb_id, _mod.wikipedia_plot, _mod.wikipedia_plot_from_imdb = (
-        _patched_get, _patched_get_imdb, _patched_wp, _patched_wpimdb)
-    # thin_rescue prints [thin_rescue]... when its score floor culls a list; suppress during
-    # smoke asserts so --help and other CLI invocations don't print it.
-    _smoke_buf = _io.StringIO()
-    try:
-        # Queries chosen so A's long plot overlaps each phrasing on >=3 stemmed tokens →
-        # max score >= 6 > STRICT_FLOOR(4); B's overview has no overlap on either phrasing.
-        with contextlib.redirect_stdout(_smoke_buf):
-            result = plot_queries_search(
-                ["innocent man wrongfully convicted", "clever lawyer in court"], "fakekey")
-        titles = sorted(m["title"] for m in result)
-        assert titles == ["Movie A"], f"only A matches both phrasings (max-of-queries rescues B), got {titles}"
-    finally:
-        _mod.get, _mod.get_imdb_id, _mod.wikipedia_plot, _mod.wikipedia_plot_from_imdb = (
-            _orig_get, _orig_get_imdb, _orig_wp, _orig_wpimdb)
-
-    # Smoke check: thin_rescue leaves a full list alone and expands a thin one.
-    import contextlib, io
-    full = [{"id": i, "title": f"f{i}", "vote_count": 100, "_score": 5} for i in range(7)]
-    _buf = io.StringIO()
-    with contextlib.redirect_stdout(_buf):
-        kept = thin_rescue(list(full), ["anything"], "fakekey")
-    assert [m["id"] for m in kept] == [m["id"] for m in full], "full list returns unchanged"
-
-    # Thin list triggers rescue — patches out network IO so the test is offline.
-    thin = [{"id": 1, "title": "Seed", "vote_count": 100, "_score": 5}]
-    def _rec_get(path, params, *, key):
-        # /movie/{id}/recommendations returns a single neighbor; /search/movie returns the seed.
-        if "/recommendations" in path:
-            return {"results": [{"id": 99, "title": "Rescued Movie", "overview": "innocent man proves himself in court"}]}
-        if "/search/movie" in path:
-            return {"results": [{"id": 1, "title": "Seed"}]}
-        return {"results": []}
-    def _rec_wpimdb(_): return "an innocent man wrongfully accused proves his innocence in court"
-    _mod.get = _rec_get
-    _mod.wikipedia_plot = lambda _: None
-    _mod.wikipedia_plot_from_imdb = _rec_wpimdb
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            rescued = thin_rescue(list(thin), ["innocent man proves himself"], "fakekey")
-        # neighbor survives the floor (plot mentions all key query words via token-overlap)
-        ids = {m["id"] for m in rescued}
-        assert 99 in ids, f"rescue added neighbor, got ids {ids}"
-    finally:
-        _mod.get, _mod.wikipedia_plot, _mod.wikipedia_plot_from_imdb = _orig_get, _orig_wp, _orig_wpimdb
-
-    # Smoke check: quick mode skips Wikipedia fetches and uses TMDB overview + OMDb plot.
-    # Tracks which fetchers were called without making any network requests.
-    _calls = {"wiki": 0, "omdb": 0}
-
-    def _track_wp(_): _calls["wiki"] += 1; return None
-    def _track_wpimdb(_): _calls["wiki"] += 1; return "stale cached wiki plot"
-    def _track_omdb_plot(*a): _calls["omdb"] += 1; return None
-    _orig_omdb = _mod.omdb_long_plot
-    _mod.wikipedia_plot = _track_wp
-    _mod.wikipedia_plot_from_imdb = _track_wpimdb
-    _mod.omdb_long_plot = _track_omdb_plot
-    _mod.get_imdb_id = lambda *a, **kw: "tt0000001"
-    _omdb_hit = "a detailed courtroom scenario plays out over many minutes"
-    _film = {"id": 1, "overview": "innocent man proves himself"}
-    try:
-        # The tracker's default returns None — substitute one that hits so quick_text uses OMDb.
-        _mod.omdb_long_plot = lambda *a, **kw: _omdb_hit
-        text_quick = _mod._quick_text(_film, "x")
-        assert _calls["wiki"] == 0, "quick mode must not call Wikipedia"
-        assert text_quick == _omdb_hit, "OMDb long plot wins when available"
-        # OMDb missing (env unset) — quick_text falls back to overview.
-        _calls["omdb"] = 0
-        _mod.omdb_long_plot = lambda *a, **kw: None
-        # os.environ.get('OMDB_API_KEY') may be set in this shell; force the "no key" branch.
-        _prev = os.environ.pop("OMDB_API_KEY", None)
-        try:
-            # With no IMDb id, OMDb won't be called and overview returns directly.
-            _mod.get_imdb_id = lambda *a, **kw: None
-            text_no_imdb = _mod._quick_text(_film, "x")
-            assert _calls["omdb"] == 0, "no IMDb id means no OMDb call"
-            assert text_no_imdb == "innocent man proves himself", "overview is the fallback text"
-        finally:
-            if _prev is not None: os.environ["OMDB_API_KEY"] = _prev
-        # Full mode (no quick flag) hits Wikipedia first — restore get_imdb_id too.
-        _mod.get_imdb_id = lambda *a, **kw: "tt0000001"
-        _calls["wiki"] = 0
-        _mod.wikipedia_plot = _track_wp
-        _mod.wikipedia_plot_from_imdb = _track_wpimdb
-        text_full = _mod._full_text(_film, "x")
-        assert _calls["wiki"] >= 1, "full mode uses Wikipedia fetcher"
-        assert text_full == "stale cached wiki plot", "full mode prefers the cached wikitext"
-    finally:
-        _mod.wikipedia_plot = _orig_wp
-        _mod.wikipedia_plot_from_imdb = _orig_wpimdb
-        _mod.omdb_long_plot = _orig_omdb
-
-    # Smoke check: gemini_recommendations parses Gemini's numbered list, handles year
-    # suffixes in parens, drops lines, and resolves via TMDB. Mocked end-to-end (no network).
-    import os as _os
-    _mod = _sys.modules[__name__]
-    _gemini_response = json.dumps({
-        "candidates": [{"content": {"parts": [{"text":
-            "1. Idiocrazy (2006)\n"
-            "2. Bulworth\n"
-            "3. The Death of Stalin (2017) - Soviet satire\n"
-            "4. In the Loop\n"
-            "5. Some Hallucinated Garbage (2030)\n"
-        }]}}]
-    }).encode()
-    _fake_results = {
-        0: {"id": 1, "title": "Idiocrazy", "vote_count": 100},  # typo'd, gemini-voted most often
-        1: {"id": 2, "title": "Bulworth", "vote_count": 100},
-        2: {"id": 3, "title": "The Death of Stalin", "vote_count": 100},
-        3: {"id": 4, "title": "In the Loop", "vote_count": 100},
-    }
-    def _fake_urlopen_gemini(req, timeout=10):
-        from urllib.error import HTTPError
-        return type("Resp", (), {"read": lambda self: _gemini_response, "__enter__": lambda s: s, "__exit__": lambda *a: None})()
-
-    class _FakeResp:
-        def __init__(self, body): self.body = body
-        def read(self): return self.body
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-
-    def _fake_urlopen(req, timeout=10):
-        # Dispatch on URL: Gemini calls return the canned response, TMDB calls return results.
-        from urllib.parse import urlparse
-        url = req.get_full_url() if hasattr(req, "get_full_url") else req
-        if "generativelanguage" in url:
-            return _FakeResp(_gemini_response)
-        # /search/movie?query=X — pull 'query' from the URL string itself.
-        from urllib.parse import parse_qs
-        qs = parse_qs(url.split("?", 1)[1])
-        query = qs.get("query", [""])[0]
-        idx = {"Idiocrazy": 0, "Bulworth": 1, "The Death of Stalin": 2, "In the Loop": 3}.get(query, None)
-        if idx is None:
-            return _FakeResp(json.dumps({"results": []}).encode())
-        return _FakeResp(json.dumps({"results": [_fake_results[idx]]}).encode())
-
-    # Restore the caller's env rather than pop() it; otherwise the key stays unset for any
-    # CLI invocation that runs after the smoke.
-    _prev_gemini = _os.environ.get("GEMINI_API_KEY")
-    _os.environ["GEMINI_API_KEY"] = "fakekey"
-    _orig_urlopen = _mod.urllib.request.urlopen
-    _mod.urllib.request.urlopen = _fake_urlopen
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = gemini_recommendations("whatever", "fakekey", n=5)
-        # 5 lines parsed, "Some Hallucinated Garbage" dropped, 4 returned with TMDB ids.
-        titles = [m["title"] for m in result]
-        assert titles == ["Idiocrazy", "Bulworth", "The Death of Stalin", "In the Loop"], f"parse+resolve failed: {titles}"
-    finally:
-        _mod.urllib.request.urlopen = _orig_urlopen
-        if _prev_gemini is None:
-            _os.environ.pop("GEMINI_API_KEY", None)
-        else:
-            _os.environ["GEMINI_API_KEY"] = _prev_gemini
-
-    # Smoke check: n-gram keyword matching prefers the longest phrase and skips stopword-only grams.
-    _fake_catalog = {"time travel": 4379, "time": 999, "dimension": 1234}
-    assert keywords_in_query("time traveling, plot twists", _fake_catalog) == [4379], \
-        "longest-phrase match ('time travel' must beat bare 'time')"
-    assert keywords_in_query("a dimension of the mind", _fake_catalog) == [1234], "1-gram fallback"
-    assert keywords_in_query("the a of", _fake_catalog) == [], "stopword-only query matches nothing"
-    assert keywords_in_query("anything", {}) == [], "empty catalog is not fatal"
-
-    # Smoke check: shortlist tolerates missing fields.
-    assert [m["title"] for m in shortlist([
-        {"title": "A", "vote_average": 8.0},
-        {"title": "B"},
-    ])] == ["A", "B"]
-
-    # Smoke check: print_movies must not KeyError on TV results (name/first_air_date, no `title`).
-    import io, contextlib
-    _buf = io.StringIO()
-    with contextlib.redirect_stdout(_buf):
-        print_movies([{"id": 1, "name": "Malcolm", "first_air_date": "2000-01-09", "vote_average": 8.0}])
-    assert "Malcolm (2000)" in _buf.getvalue(), "TV rows render in text output"
-
-    # Smoke check: HTML escapes titles, keeps flatrate-only filter, includes poster + IMDB + popcorn emoji.
-    fake_row = Row(
-        movie=Movie(id=1, title="<script>", release_date="2020-01-01",
-                    vote_average=7.5, vote_count=100, overview="x",
-                    poster_path="/abc.jpg"),
-        media_type="movie",
-        poster_html='<img class="poster" src="x" alt="">',
-        imdb_url="https://www.imdb.com/title/tt123/",
-        providers=Provider(
-            flatrate=[ProviderEntry(provider_name="Netflix")],
-            rent=[ProviderEntry(provider_name="Apple TV")],
-            buy=[],
-        ),
-        reviews=[],
-    )
-    card_html = _movie_card(fake_row)
-    html_doc = _html_template(card_html, _sidebar_html())
-    assert "&lt;script&gt;" in html_doc, "XSS escaping"
-    assert "Netflix" in card_html and "Apple TV" not in card_html, "flatrate-only filter on card"
-    assert '<img class="poster"' in card_html, "poster present"
-    assert 'class="imdb' in card_html, "IMDB link present"
-    assert 'class="lb' in card_html, "Letterboxd link present"
-    assert 'class="jw' in card_html, "JustWatch link present"
-    assert 'data-providers="Netflix"' in card_html, "provider filter data attribute on card"
-    assert "🍿" in html_doc, "popcorn emoji in header"
-    assert "aspect-ratio:2/3" not in html_doc, "poster no longer cropped"
-    assert "<!DOCTYPE" in html_doc
-    # Sidebar lists all 10 TOP_PROVIDERS as checkboxes.
-    assert html_doc.count('class="provider-filter"') == 1
-    for p in TOP_PROVIDERS:
-        assert p in html_doc, f"sidebar missing provider {p}"
-
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separate from main() so it can be built without running a search."""
     parser = argparse.ArgumentParser(
         description="Recommend movies from TMDB + Wikipedia + OMDb + Claude.",
     )
@@ -1617,9 +1359,17 @@ if __name__ == "__main__":
     # origin_country field — no extra API calls. Pair with --plot-query for "best films from X".
     parser.add_argument("--nationality", metavar="CC",
                         help="ISO 3166-1 alpha-2 country code (e.g. HU, NO, JP, FR); keeps only films from that country")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Run one search and print it as text or HTML. Returns a process exit code."""
+    parser = build_parser()
     args = parser.parse_args()
 
-    key = os.environ["TMDB_API_KEY"]
+    key = os.environ.get("TMDB_API_KEY")
+    if not key:
+        sys.exit("TMDB_API_KEY not set. Get one at https://www.themoviedb.org/settings/api and export it.")
     omdb_key = None if args.no_omdb or args.google else os.environ.get("OMDB_API_KEY")
 
     if args.plot_query and args.plot_queries:
@@ -1708,3 +1458,9 @@ if __name__ == "__main__":
         print(f"wrote {clickable}")
     else:
         print_movies(movies, key=key if key else None)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

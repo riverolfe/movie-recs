@@ -196,7 +196,7 @@ Without `--html`, results are printed to the terminal as a plain text shortlist.
 
 ## Skip-list
 
-The script already has: pagination, provider filtering, reviews, OMDb/Wikipedia enrichment, Gemini + LLM scoring, a diskcache-backed plot cache, multi-query union (Gemini and legacy), thin-list CF rescue, `--google`/`--no-google`/`--quick` modes. Don't add further caching layers, retry/backoff beyond the existing one-shot retry, multi-language output, or fuzzy title matching unless asked. Don't rewrite the script inline — extend it in place, and keep the `__main__` smoke asserts passing (`python3 $SCRIPT --help` runs them).
+The script already has: pagination, provider filtering, reviews, OMDb/Wikipedia enrichment, Gemini + LLM scoring, a diskcache-backed plot cache, multi-query union (Gemini and legacy), thin-list CF rescue, `--google`/`--no-google`/`--quick` modes. Don't add further caching layers, retry/backoff beyond the existing one-shot retry, multi-language output, or fuzzy title matching unless asked. Don't rewrite the script inline — extend it in place, and keep the checks passing (`python3 test_movie_recs.py`; the CLI entry point is `main()`, so `--help` no longer runs them).
 
 NotebookLM persistence (`## NotebookLM`) is intentionally additive and agent-side — it lives in `SKILL.md` and `notebooks.json`, not in `movie_recs.py`. Don't move NotebookLM calls into the script.
 
