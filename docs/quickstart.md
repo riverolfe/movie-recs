@@ -51,10 +51,9 @@ If `notebooklm-mcp` is wired into your harness, the agent auto-syncs successful 
 ## 4. Sanity check
 
 ```bash
-python3 movie_recs.py --help        # prints usage; the __main__ smoke asserts run too
+python3 movie_recs.py --help        # prints usage without making API calls
+python3 test_movie_recs.py          # run the offline checks
 ```
-
-> ⚠ **Heads-up:** the multi-query dedupe assert at `movie_recs.py:1403` currently fails against live TMDB (it expects one title the test doesn't get back). Unrelated to the rename — flag for a follow-up.
 
 ## What's where
 

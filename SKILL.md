@@ -6,7 +6,7 @@ allowed-tools: Bash(python3:*), Bash(export:*)
 
 # movie-recs
 
-Everything runs through the bundled `movie_recs.py`. Stdlib (urllib) plus one optional dependency, `diskcache` — **do not hand-roll `urllib` calls**, the script already covers every documented flow.
+`movie_recs.py` is the CLI entry point and compatibility API. Keep its sibling `movie_recs_plot.py` and `movie_recs_html.py` alongside it; they hold plot ranking and HTML presentation. Stdlib (urllib) plus one optional dependency, `diskcache` — **do not hand-roll `urllib` calls**, the script already covers every documented flow.
 
 ```
 SCRIPT=~/.claude/skills/movie-recs/movie_recs.py

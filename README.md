@@ -1,7 +1,8 @@
 # movie-recs
 
-Recommend movies and TV from a short user description. Stdlib-only Python script
-(`movie_recs.py`, ~90 KB) that calls TMDB, Gemini, OMDb, and Wikipedia.
+Recommend movies and TV from a short user description. A small Python CLI that
+calls TMDB, Gemini, OMDb, and Wikipedia. HTTP and the core workflow use the
+standard library; `diskcache` and the Anthropic SDK are optional.
 
 ![Example HTML output](./docs/movie_recs_html.png)
 
@@ -31,7 +32,7 @@ python3 movie_recs.py --plot-query "canonical Hungarian cinema..." --nationality
 
 ## Requirements
 
-- Python 3.10+ (stdlib only; `diskcache` and `anthropic` are optional)
+- Python 3.10+ (`diskcache` and `anthropic` are optional)
 - API keys: TMDB (required), Gemini (required for `--plot-query`), OMDb (optional), Anthropic (optional)
 
 See [`docs/quickstart.md`](./docs/quickstart.md) for how to obtain and set them up.
@@ -39,11 +40,14 @@ See [`docs/quickstart.md`](./docs/quickstart.md) for how to obtain and set them 
 ## Layout
 
 ```
-movie_recs.py   the script
-SKILL.md        full skill reference (Claude Code integration, NotebookLM, quirks)
-LICENSE         MIT
-tmdb-api.json   TMDB OpenAPI 3.1 spec (bundled, no secrets)
-notebooks.json  UUIDs of the two NotebookLM notebooks (recs + plots)
+movie_recs.py       CLI entry point and compatibility API
+movie_recs_plot.py  plot-query matching and ranking
+movie_recs_html.py  HTML presentation helpers
+test_movie_recs.py  offline checks; no API keys or network required
+SKILL.md            full skill reference (Claude Code integration, NotebookLM, quirks)
+LICENSE             MIT
+tmdb-api.json       TMDB OpenAPI 3.1 spec (bundled, no secrets)
+notebooks.json      UUIDs of the two NotebookLM notebooks (recs + plots)
 docs/
   quickstart.md         1-page setup + first runs
   movie_recs_html.png   example HTML output (shown above)
