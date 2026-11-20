@@ -474,6 +474,39 @@ def test_gemini_recommendations_parses_and_resolves():
     assert titles == ["Idiocrazy", "Bulworth", "The Death of Stalin", "In the Loop"], titles
 
 
+def test_gemini_falls_back_when_the_primary_model_is_unavailable():
+    """429/503/404 on the primary must switch to the fallback model, and a thought
+    part must not be parsed as a title."""
+    calls = []
+
+    def handler(url):
+        calls.append(url)
+        if "gemini-4-hydrogen" in url:
+            raise urllib.error.HTTPError(url, 429, "quota", {}, io.BytesIO(b'{"error": {"message": "quota"}}'))
+        if "gemini-3.5-flash-lite" in url:
+            body = json.dumps({"candidates": [{"content": {"parts": [
+                {"text": "Let me think about spy films.", "thought": True},
+                {"text": "1. Idiocrazy\n2. Bulworth\n"},
+            ]}, "finishReason": "STOP"}]}).encode()
+            return FakeResp(body)
+        raise AssertionError("unexpected request " + url)
+
+    prev = os.environ.get("GEMINI_API_KEY")
+    os.environ["GEMINI_API_KEY"] = "fakekey"
+    try:
+        with patched(GEMINI_MODEL="gemini-4-hydrogen", GEMINI_FALLBACK="gemini-3.5-flash-lite"), \
+                patched(_primary_down=False), fake_urlopen(handler), quiet():
+            text = m._gemini_generate("prompt", "fakekey", "gemini-4-hydrogen")
+    finally:
+        if prev is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = prev
+    assert text.startswith("1. Idiocrazy"), text
+    assert "think about" not in text, "thought parts must not leak into the answer"
+    assert any("gemini-3.5-flash-lite" in c for c in calls), calls
+
+
 # --- keyword matching -------------------------------------------------------
 
 def test_keywords_in_query():

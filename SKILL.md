@@ -31,6 +31,8 @@ Log the denial once, summarize what's missing, and propose an alternative. Never
 | `TMDB_API_KEY` | **yes** | script exits; register at https://www.themoviedb.org/settings/api (~2 min, free) |
 | `OMDB_API_KEY` | no | skips the long plot paragraph + Rotten Tomatoes score on HTML cards |
 | `GEMINI_API_KEY` | **yes for `--plot-query`** | default path runs Gemini; without it, exit |
+| `GEMINI_MODEL` | no | ranking model for `--plot-query` (default `gemini-4-hydrogen`); override to switch models |
+| `GEMINI_FALLBACK` | no | model used when the primary is unavailable (default `gemini-3.5-flash-lite`) |
 | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | no | `--no-google` legacy path falls back to token-overlap scoring instead of LLM-as-judge |
 | `notebooklm-mcp` (harness) | no | cross-session memory + plot semantic search; if unavailable, fall back to stateless flow (see `## NotebookLM`) |
 
@@ -151,7 +153,12 @@ Prefer `--similar-to` with a representative film — it needs no keyword id and 
 
 ## What --plot-query actually does (default: Gemini)
 
-`--plot-query` is the default ranker. The script calls Gemini (3.5 Flash Lite) with your query, asks for ~25 film titles, parses the numbered-list response, then resolves each title via TMDB `/search/movie`. Hallucinated titles that TMDB can't find are dropped — the count is printed on the CLI as `[gemini] N of M titles not found on TMDB (dropped): [...]`.
+`--plot-query` is the default ranker. The script calls Gemini with your query, asks for ~25 film titles, parses the numbered-list response, then resolves each title via TMDB `/search/movie`. Hallucinated titles that TMDB can't find are dropped — the count is printed on the CLI as `[gemini] N of M titles not found on TMDB (dropped): [...]`.
+
+**Model:** `gemini-4-hydrogen` by default (`GEMINI_MODEL` overrides), falling back to `gemini-3.5-flash-lite` (`GEMINI_FALLBACK` overrides). The fallback fires on 400 (primary rejects the request config), 404 (key has no access), 429 (quota), 500/502/504 (transient) and 503 (demand), on an empty or truncated (`MAX_TOKENS`) answer, and on a response with no candidates (blocked prompt). Each switch prints a `[gemini] …` line on stderr; a failed primary is remembered, so later queries in a `--plot-queries` run skip it instead of re-attempting it.
+
+- Free tier for hydrogen: **5 RPM, 250k input TPM, 20 RPD per project** — limits are per project, not per key; RPD resets at midnight PT. Over the cap gives 429, which is the fallback trigger.
+- Gemini 4 is a thinking model: ~2.5k tokens of reasoning before the answer, so the request budget is `maxOutputTokens: 8192` (smaller budgets return empty text with `finishReason: MAX_TOKENS`). Its reasoning comes back as separate `thought` parts and is dropped before parsing. `thinkingConfig` goes to Gemini 4 only — flash-lite rejects it with a 400.
 
 **Cost:** one Gemini API call + ~25 TMDB searches. Measured ~17s end-to-end vs ~55s for the legacy pipeline, with materially better results.
 

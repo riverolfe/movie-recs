@@ -797,8 +797,17 @@ def _build_plot_pool(queries: List[str], key: str) -> tuple:
 # Skips Wikipedia fetches and the per-film LLM scorer — Gemini's ranking is the final ranking.
 # Cheaper than the full pipeline (no LLM call per film, no keyword catalog round-trip),
 # at the cost of Gemini hallucinating ~5-10% of titles that TMDB can't resolve.
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
+# Gemini 4 on the free tier answers 429 (project quota), 503 (demand) and 404 (key
+# has no access); flash-lite keeps the run alive in all three.
+GEMINI_FALLBACK = os.environ.get("GEMINI_FALLBACK", "gemini-3.5-flash-lite")
+# 400 counts too: a Pro-tier model rejects thinkingBudget=0, and the fallback
+# sends a different config, so it may still succeed.
+GEMINI_FALLBACK_CODES = (400, 404, 429, 500, 502, 503, 504)
 GEMINI_HOST = "https://generativelanguage.googleapis.com/v1beta"
+
+# Set once the primary model has failed, so a multi-query run does not re-attempt it.
+_primary_down = False
 
 
 def gemini_multi_recommendations(queries: List[str], key: str, per_query: int = 25) -> List[dict]:
@@ -817,6 +826,82 @@ def gemini_multi_recommendations(queries: List[str], key: str, per_query: int = 
             seen_ids.add(m["id"])
             union.append(m)
     return union
+
+
+def _gemini_generate(prompt: str, api_key: str, model: str) -> str:
+    """One generateContent call. Falls back to GEMINI_FALLBACK when the model is
+    unavailable (quota / demand / no access) so a busy model doesn't kill the run.
+
+    Gemini 4 reasons before answering whatever the thinking budget says (~2.5k
+    tokens), so the request budget has to cover reasoning + the list — a smaller
+    budget returns empty text with finishReason MAX_TOKENS. Reasoning comes back
+    as separate `thought` parts and must not be mixed into the title list.
+    """
+    global _primary_down
+    config = {
+        # Temperature 0.2 — narrow band where similar prompts stay coherent without collapsing to the same list.
+        "maxOutputTokens": 2048,
+        "temperature": 0.2,
+    }
+    if model.startswith("gemini-4"):
+        config["maxOutputTokens"] = 8192
+        # thinkingConfig is rejected by flash-lite (400), so it goes to Gemini 4 only.
+        config["thinkingConfig"] = {"thinkingBudget": 0}
+    body = json.dumps({
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": config,
+    }).encode()
+
+    url = f"{GEMINI_HOST}/models/{model}:generateContent?key={api_key}"
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            response = json.load(r)
+    except urllib.error.HTTPError as e:
+        # Read the body for the API's own message — "model not available to new users"
+        # looks the same as "bad key" without surfacing the actual reason.
+        try:
+            detail = json.loads(e.read()).get("error", {}).get("message", "")
+        except Exception:
+            detail = e.reason
+        if e.code in GEMINI_FALLBACK_CODES and model != GEMINI_FALLBACK:
+            print(f"[gemini] {model} unavailable ({e.code}) -> falling back to {GEMINI_FALLBACK}",
+                  file=sys.stderr, flush=True)
+            if model == GEMINI_MODEL:
+                _primary_down = True
+            return _gemini_generate(prompt, api_key, GEMINI_FALLBACK)
+        sys.exit(f"Gemini {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        sys.exit(f"Gemini unreachable: {e.reason}")
+
+    candidates = response.get("candidates") or []
+    if not candidates:
+        # A blocked prompt comes back without any candidate at all.
+        block = response.get("promptFeedback", {}).get("blockReason", "no candidates")
+        if model != GEMINI_FALLBACK:
+            print(f"[gemini] {model} returned no candidates ({block}) -> falling back to {GEMINI_FALLBACK}",
+                  file=sys.stderr, flush=True)
+            if model == GEMINI_MODEL:
+                _primary_down = True
+            return _gemini_generate(prompt, api_key, GEMINI_FALLBACK)
+        sys.exit(f"Gemini returned no candidates ({block})")
+
+    candidate = candidates[0]
+    parts = candidate.get("content", {}).get("parts") or []
+    # Reasoning parts carry the model's thinking, not the answer.
+    parts = [p for p in parts if not p.get("thought") and not p.get("thoughtSummary")]
+    text = "".join(p.get("text", "") for p in parts).strip()
+    finish = candidate.get("finishReason")
+    if (not text or finish == "MAX_TOKENS") and model != GEMINI_FALLBACK:
+        why = "returned no text" if not text else "truncated (MAX_TOKENS)"
+        print(f"[gemini] {model} {why} -> falling back to {GEMINI_FALLBACK}",
+              file=sys.stderr, flush=True)
+        if model == GEMINI_MODEL:
+            _primary_down = True
+        return _gemini_generate(prompt, api_key, GEMINI_FALLBACK)
+    if not text:
+        sys.exit(f"Gemini returned no text (finishReason {finish})")
+    return text
 
 
 def gemini_recommendations(query: str, key: str, n: int = 25) -> List[dict]:
@@ -838,29 +923,9 @@ def gemini_recommendations(query: str, key: str, n: int = 25) -> List[dict]:
         f"2. Title (Year)\n"
         f"No commentary, no explanations, no categories. Just the list."
     )
-    body = json.dumps({
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        # Temperature 0.2 — narrow band where similar prompts stay coherent without collapsing to the same list.
-        "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.2},
-    }).encode()
-
-    url = f"{GEMINI_HOST}/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            response = json.load(r)
-    except urllib.error.HTTPError as e:
-        # Read the body for the API's own message — "model not available to new users"
-        # looks the same as "bad key" without surfacing the actual reason.
-        try:
-            detail = json.loads(e.read()).get("error", {}).get("message", "")
-        except Exception:
-            detail = e.reason
-        sys.exit(f"Gemini {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        sys.exit(f"Gemini unreachable: {e.reason}")
-
-    text = response["candidates"][0]["content"]["parts"][0]["text"].strip()
+    # A failed primary is remembered: later queries in a multi-query run skip it.
+    model = GEMINI_FALLBACK if _primary_down else GEMINI_MODEL
+    text = _gemini_generate(prompt, api_key, model)
 
     # Parse "1. Title", "1) Title", or "- Title (Year)" lines. Strip numbering and parenthetical year.
     titles: List[str] = []
